@@ -1,50 +1,107 @@
-from flask import Flask, request
+# app.py
 import os
+import ipaddress
+from datetime import datetime
+from flask import Flask, request, jsonify
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 
 app = Flask(__name__)
+DB_DSN = os.environ.get("DB_DSN")  # e.g. postgresql://user:pass@host:5432/db
 
-DB_DSN = os.environ.get("DB_DSN")
+def get_conn():
+    return psycopg2.connect(DB_DSN, cursor_factory=RealDictCursor)
+
+def validate_ip(ip):
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except Exception:
+        return False
 
 def init_db():
-    conn = psycopg2.connect(DB_DSN, cursor_factory=RealDictCursor)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS ip_logs (
-            id SERIAL PRIMARY KEY,
-            ip TEXT,
-            user_agent TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
+    CREATE TABLE IF NOT EXISTS observed_endpoints (
+        id BIGSERIAL PRIMARY KEY,
+        ip INET NOT NULL UNIQUE,
+        family SMALLINT NOT NULL,
+        device_id TEXT,
+        first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+        sensor TEXT,
+        public BOOLEAN DEFAULT FALSE,
+        user_agent TEXT,
+        raw_payload JSONB
+    );
     """)
     conn.commit()
     cur.close()
     conn.close()
 
-init_db()
+@app.before_first_request
+def setup():
+    init_db()
 
-@app.route("/", methods=["GET", "POST"])
-def collect():
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+@app.route("/api/v1/report", methods=["POST"])
+def report():
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "invalid json"}), 400
+
+    local_ips = data.get("local_ips", [])
+    public_ipv4 = data.get("public_ipv4")
+    public_ipv6 = data.get("public_ipv6")
     ua = request.headers.get("User-Agent", "")
-    conn = psycopg2.connect(DB_DSN, cursor_factory=RealDictCursor)
+
+    # device_id = ưu tiên public IP, nếu không thì lấy local IP đầu tiên
+    device_id = public_ipv4 or public_ipv6 or (local_ips[0] if local_ips else "unknown")
+
+    now = datetime.utcnow()
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("INSERT INTO ip_logs (ip, user_agent) VALUES (%s, %s)", (ip, ua))
+
+    def upsert(ip, is_public=False):
+        if not ip or not validate_ip(ip):
+            return
+        family = 4 if ":" not in ip else 6
+        cur.execute("""
+        INSERT INTO observed_endpoints (ip, family, device_id, first_seen, last_seen, sensor, public, user_agent, raw_payload)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (ip) DO UPDATE
+          SET last_seen = EXCLUDED.last_seen,
+              device_id = EXCLUDED.device_id,
+              public = EXCLUDED.public OR observed_endpoints.public,
+              user_agent = EXCLUDED.user_agent,
+              raw_payload = EXCLUDED.raw_payload
+        """, (
+            ip, family, device_id, now, now, device_id, is_public, ua, Json(data)
+        ))
+
+    for ip in local_ips:
+        upsert(ip, False)
+    if public_ipv4:
+        upsert(public_ipv4, True)
+    if public_ipv6:
+        upsert(public_ipv6, True)
+
     conn.commit()
     cur.close()
     conn.close()
-    return {"status": "ok", "ip": ip}
 
-@app.route("/logs")
+    return jsonify({"status": "ok", "device_id": device_id}), 200
+
+@app.route("/api/v1/logs", methods=["GET"])
 def logs():
-    conn = psycopg2.connect(DB_DSN, cursor_factory=RealDictCursor)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM ip_logs ORDER BY created_at DESC LIMIT 50")
+    cur.execute("SELECT id, ip::text as ip, device_id, public, last_seen FROM observed_endpoints ORDER BY last_seen DESC LIMIT 50")
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    return {"logs": rows}
+    return jsonify(rows)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
