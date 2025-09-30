@@ -193,4 +193,34 @@ def export_csv():
                 FROM logs
                 ORDER BY created_at DESC
                 LIMIT %s
-            """,
+            """, (limit,))
+            for row in cur:
+                writer.writerow([row.get(c) for c in header])
+                yield out.getvalue()
+                out.seek(0); out.truncate(0)
+            cur.close(); conn.close()
+        except Exception as e:
+            app.logger.exception("export failed: %s", e)
+            out.write("\n"); yield out.getvalue()
+
+    filename = f"logs_export_{int(time.time())}.csv"
+    return Response(stream_with_context(generate()), mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+@app.route("/clear_logs", methods=["POST"])
+@requires_auth
+def clear_logs():
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("TRUNCATE TABLE logs;")
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"status": "cleared"})
+    except Exception as e:
+        app.logger.exception("clear failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+# ---------- run ----------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
